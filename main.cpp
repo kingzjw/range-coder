@@ -6,14 +6,27 @@
 int main()
 {
 	AdaptiveRangeCoder arc;
-	//test data
+
+	//===========================================================
+
+	//创建test data
 	std::vector<char> inputByteVector;
-	inputByteVector.push_back('i');
-	inputByteVector.push_back(' ');
-	inputByteVector.push_back('z');
-	inputByteVector.push_back('j');
-	inputByteVector.push_back('w');
+	std::ifstream ifs2("english.txt");
+	if (ifs2)
+	{
+		char c;
+		while (ifs2 >> c)
+		{
+			inputByteVector.push_back(c);
+		}
+	}
+	else
+	{
+		std::cout << "failed" << std::endl;
+	}
 	
+	//===========================================================
+
 	std::ofstream of("compressData.txt");
 	if (of)
 	{
@@ -28,7 +41,7 @@ int main()
 	//========================================================
 
 	std::vector<char> resData;
-	resData.resize(100);
+	resData.resize(inputByteVector.size());
 	AdaptiveRangeCoder arc2;
 	std::ifstream ifs("compressData.txt");
 	if (ifs)
@@ -36,6 +49,24 @@ int main()
 		int length = arc2.decodeStreamToCharVector(ifs, resData);
 		ifs.close();
 	}else
+	{
+		std::cout << "failed" << std::endl;
+	}
+
+	//=========================================================
+	//把解压出来的东西，放到文件里
+
+	//创建test data
+	
+	std::ofstream ofs2("english_res.txt");
+	if (ofs2)
+	{
+		for (int i = 0; i < resData.size(); i++)
+		{
+			ofs2 << resData[i];
+		}
+	}
+	else
 	{
 		std::cout << "failed" << std::endl;
 	}
