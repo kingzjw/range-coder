@@ -1,9 +1,245 @@
+/*
+ * Software License Agreement (BSD License)
+ *
+ *  Point Cloud Library (PCL) - www.pointclouds.org
+ *  Copyright (c) 2010-2012, Willow Garage, Inc.
+ *
+ *  All rights reserved.
+ *
+ *  Redistribution and use in source and binary forms, with or without
+ *  modification, are permitted provided that the following conditions
+ *  are met:
+ *
+ *   * Redistributions of source code must retain the above copyright
+ *     notice, this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above
+ *     copyright notice, this list of conditions and the following
+ *     disclaimer in the documentation and/or other materials provided
+ *     with the distribution.
+ *   * Neither the name of Willow Garage, Inc. nor the names of its
+ *     contributors may be used to endorse or promote products derived
+ *     from this software without specific prior written permission.
+ *
+ *  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ *  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ *  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ *  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+ *  COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ *  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ *  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ *  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ *  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ *  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ *  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ *  POSSIBILITY OF SUCH DAMAGE.
+ *
+ *
+ * range coder based on Dmitry Subbotin's carry-less implementation (http://www.compression.ru/ds/)
+ * Added optimized symbol lookup and fixed/static frequency tables
+ *
+ */
+
+#ifndef __PCL_IO_RANGECODING__HPP
+#define __PCL_IO_RANGECODING__HPP
+
 #include "entropy_range_coder.h"
+#include <map>
+#include <iostream>
+#include <vector>
 #include <string.h>
+#include <algorithm>
 #include <stdio.h>
 
-unsigned long StaticRangeCoder::encodeIntVectorToStream(std::vector<unsigned int>& inputIntVector_arg, std::ostream & outputByterStream_arg)
+ //////////////////////////////////////////////////////////////////////////////////////////////
+unsigned long AdaptiveRangeCoder::encodeCharVectorToStream(const std::vector<char>& inputByteVector_arg,
+	std::ostream& outputByteStream_arg)
+{
+	DWord freq[257];
+	uint8_t ch;
+	unsigned int i, j, f;
+	char out;
 
+	// define limits
+	const DWord top = static_cast<DWord> (1) << 24;
+	const DWord bottom = static_cast<DWord> (1) << 16;
+	const DWord maxRange = static_cast<DWord> (1) << 16;
+
+	DWord low, range;
+
+	unsigned int readPos;
+	unsigned int input_size;
+
+	input_size = static_cast<unsigned> (inputByteVector_arg.size());
+
+	// init output vector
+	outputCharVector_.clear();
+	outputCharVector_.reserve(sizeof(char) * input_size);
+
+	readPos = 0;
+
+	low = 0;
+	range = static_cast<DWord> (-1);
+
+	// initialize cumulative frequency table
+	for (i = 0; i < 257; i++)
+		freq[i] = i;
+
+	// scan input
+	while (readPos < input_size)
+	{
+
+		// read byte
+		ch = inputByteVector_arg[readPos++];
+
+		// map range
+		low += freq[ch] * (range /= freq[256]);
+		range *= freq[ch + 1] - freq[ch];
+
+		// check range limits
+		while ((low ^ (low + range)) < top || ((range < bottom) && ((range = -int(low) & (bottom - 1)), 1)))
+		{
+			out = static_cast<char> (low >> 24);
+			range <<= 8;
+			low <<= 8;
+			outputCharVector_.push_back(out);
+		}
+
+		// update frequency table
+		for (j = ch + 1; j < 257; j++)
+			freq[j]++;
+
+		// detect overflow
+		if (freq[256] >= maxRange)
+		{
+			// rescale
+			for (f = 1; f <= 256; f++)
+			{
+				freq[f] /= 2;
+				if (freq[f] <= freq[f - 1])
+					freq[f] = freq[f - 1] + 1;
+			}
+		}
+
+	}
+
+	// flush remaining data
+	for (i = 0; i < 4; i++)
+	{
+		out = static_cast<char> (low >> 24);
+		outputCharVector_.push_back(out);
+		low <<= 8;
+	}
+
+	// write to stream
+	outputByteStream_arg.write(&outputCharVector_[0], outputCharVector_.size());
+
+	return (static_cast<unsigned long> (outputCharVector_.size()));
+
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+unsigned long
+AdaptiveRangeCoder::decodeStreamToCharVector(std::istream& inputByteStream_arg,
+	std::vector<char>& outputByteVector_arg)
+{
+	uint8_t ch;
+	DWord freq[257];
+	unsigned int i, j, f;
+
+	// define limits
+	const DWord top = static_cast<DWord> (1) << 24;
+	const DWord bottom = static_cast<DWord> (1) << 16;
+	const DWord maxRange = static_cast<DWord> (1) << 16;
+
+	DWord low, range;
+	DWord code;
+
+	unsigned int outputBufPos;
+	unsigned int output_size = static_cast<unsigned> (outputByteVector_arg.size());
+
+	unsigned long streamByteCount;
+
+	streamByteCount = 0;
+
+	outputBufPos = 0;
+
+	code = 0;
+	low = 0;
+	range = static_cast<DWord> (-1);
+
+	// init decoding
+	for (i = 0; i < 4; i++)
+	{
+		inputByteStream_arg.read(reinterpret_cast<char*> (&ch), sizeof(char));
+		streamByteCount += sizeof(char);
+		code = (code << 8) | ch;
+	}
+
+	// init cumulative frequency table
+	for (i = 0; i <= 256; i++)
+		freq[i] = i;
+
+	// decoding loop
+	for (i = 0; i < output_size; i++)
+	{
+		uint8_t symbol = 0;
+		uint8_t sSize = 256 / 2;
+
+		// map code to range
+		DWord count = (code - low) / (range /= freq[256]);
+
+		// find corresponding symbol
+		while (sSize > 0)
+		{
+			if (freq[symbol + sSize] <= count)
+			{
+				symbol = static_cast<uint8_t> (symbol + sSize);
+			}
+			sSize /= 2;
+		}
+
+		// output symbol
+		outputByteVector_arg[outputBufPos++] = symbol;
+
+		// update range limits
+		low += freq[symbol] * range;
+		range *= freq[symbol + 1] - freq[symbol];
+
+		// decode range limits
+		while ((low ^ (low + range)) < top || ((range < bottom) && ((range = -int(low) & (bottom - 1)), 1)))
+		{
+			inputByteStream_arg.read(reinterpret_cast<char*> (&ch), sizeof(char));
+			streamByteCount += sizeof(char);
+			code = code << 8 | ch;
+			range <<= 8;
+			low <<= 8;
+		}
+
+		// update cumulative frequency table
+		for (j = symbol + 1; j < 257; j++)
+			freq[j]++;
+
+		// detect overflow
+		if (freq[256] >= maxRange)
+		{
+			// rescale
+			for (f = 1; f <= 256; f++)
+			{
+				freq[f] /= 2;
+				if (freq[f] <= freq[f - 1])
+					freq[f] = freq[f - 1] + 1;
+			}
+		}
+	}
+
+	return (streamByteCount);
+
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+unsigned long
+StaticRangeCoder::encodeIntVectorToStream(std::vector<unsigned int>& inputIntVector_arg,
+	std::ostream& outputByteStream_arg)
 {
 
 	unsigned int inputsymbol;
@@ -121,8 +357,8 @@ unsigned long StaticRangeCoder::encodeIntVectorToStream(std::vector<unsigned int
 		low += cFreqTable_[inputsymbol] * (range /= cFreqTable_[static_cast<std::size_t> (frequencyTableSize - 1)]);
 		range *= cFreqTable_[inputsymbol + 1] - cFreqTable_[inputsymbol];
 
-		// check range limits
-		while ((low ^ (low + range)) < top || ((range < bottom) && ((range = -low & (bottom - 1)), 1)))
+		// check range limits  range =
+		while ((low ^ (low + range)) < top || ((range < bottom) && ((range = -int(low) & (bottom - 1)), 1)))
 		{
 			out = static_cast<char> (low >> 56);
 			range <<= 8;
@@ -148,8 +384,10 @@ unsigned long StaticRangeCoder::encodeIntVectorToStream(std::vector<unsigned int
 	return (streamByteCount);
 }
 
-unsigned long StaticRangeCoder::decodeStreamToIntVector(std::istream & inputByteStream_arg, std::vector<unsigned int>& outputIntVector_arg)
-
+//////////////////////////////////////////////////////////////////////////////////////////////
+unsigned long
+StaticRangeCoder::decodeStreamToIntVector(std::istream& inputByteStream_arg,
+	std::vector<unsigned int>& outputIntVector_arg)
 {
 	uint8_t ch;
 	unsigned int i, f;
@@ -234,7 +472,7 @@ unsigned long StaticRangeCoder::decodeStreamToIntVector(std::istream & inputByte
 		range *= cFreqTable_[static_cast<std::size_t> (symbol + 1)] - cFreqTable_[static_cast<std::size_t> (symbol)];
 
 		// check range limits
-		while ((low ^ (low + range)) < top || ((range < bottom) && ((range = -low & (bottom - 1)), 1)))
+		while ((low ^ (low + range)) < top || ((range < bottom) && ((range = -int(low) & (bottom - 1)), 1)))
 		{
 			inputByteStream_arg.read(reinterpret_cast<char*> (&ch), sizeof(char));
 			streamByteCount += sizeof(char);
@@ -248,8 +486,10 @@ unsigned long StaticRangeCoder::decodeStreamToIntVector(std::istream & inputByte
 	return streamByteCount;
 }
 
-unsigned long StaticRangeCoder::encodeCharVectorToStream(const std::vector<char>& inputByteVector_arg, std::ostream & outputByteStream_arg)
-
+//////////////////////////////////////////////////////////////////////////////////////////////
+unsigned long
+StaticRangeCoder::encodeCharVectorToStream(const std::vector<char>& inputByteVector_arg,
+	std::ostream& outputByteStream_arg)
 {
 	DWord freq[257];
 	uint8_t ch;
@@ -355,8 +595,10 @@ unsigned long StaticRangeCoder::encodeCharVectorToStream(const std::vector<char>
 	return (streamByteCount);
 }
 
-unsigned long StaticRangeCoder::decodeStreamToCharVector(std::istream & inputByteStream_arg, std::vector<char>& outputByteVector_arg)
-
+//////////////////////////////////////////////////////////////////////////////////////////////
+unsigned long
+StaticRangeCoder::decodeStreamToCharVector(std::istream& inputByteStream_arg,
+	std::vector<char>& outputByteVector_arg)
 {
 	uint8_t ch;
 	DWord freq[257];
@@ -381,6 +623,9 @@ unsigned long StaticRangeCoder::decodeStreamToCharVector(std::istream & inputByt
 	outputBufPos = 0;
 
 	// read cumulative frequency table
+	//test
+	int temp = sizeof(freq);
+	//end test
 	inputByteStream_arg.read(reinterpret_cast<char*> (&freq[0]), sizeof(freq));
 	streamByteCount += sizeof(freq);
 
@@ -434,3 +679,6 @@ unsigned long StaticRangeCoder::decodeStreamToCharVector(std::istream & inputByt
 
 	return (streamByteCount);
 }
+
+#endif
+
